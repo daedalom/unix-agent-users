@@ -9,6 +9,19 @@ Subcommands:
     provision --all | --agent NAME   converge toward the config (also repairs)
     remove    (--agent|--human) NAME revoke managed artifacts, keep accounts
     status                           report state and drift
+
+INVARIANT -- never operate on agent-controlled paths as root.
+    Provisioning runs as root and is re-run routinely. An already-compromised
+    agent can plant symlinks in its home between runs, so any root operation
+    that resolves a path under an agent home is an attack surface:
+      - chown/chmod by path      -> agent gains ownership of arbitrary files
+      - reading a file by path   -> root discloses any file it can read
+      - writing/renaming by path -> root writes wherever the symlink points
+    Therefore every read, write, mkdir, chmod, or rename under an agent home
+    runs AS THE AGENT (run(..., as_user=NAME)), so path resolution happens
+    with the agent's own privileges. Root writes only to root-owned places
+    (shim dir, state dir, /etc/doas.conf). Human rc files are the one
+    exception, because humans are trusted on this machine.
 """
 
 import argparse
@@ -257,32 +270,21 @@ def ensure_agent_git(name):
 
 
 def ensure_agent_ssh_key(name):
-    pw = pwd.getpwnam(name)
-    sshdir = os.path.join(pw.pw_dir, ".ssh")
+    # All filesystem access below runs as the agent: see INVARIANT in the
+    # module docstring. Root never touches ~agent/.ssh by path.
+    home = pwd.getpwnam(name).pw_dir
+    sshdir = os.path.join(home, ".ssh")
     key = os.path.join(sshdir, "id_ed25519")
-    if not os.path.isdir(sshdir):
-        os.makedirs(sshdir, mode=0o700)
-    _chown_tree(sshdir, pw.pw_uid, pw.pw_gid)
-    os.chmod(sshdir, 0o700)
-    if not os.path.exists(key):
+    run(["mkdir", "-p", sshdir], as_user=name)
+    run(["chmod", "700", sshdir], as_user=name)
+    if run(["test", "-f", key], as_user=name, check=False).returncode != 0:
         info(f"generating ed25519 deploy key for {name}")
         run(
             ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key,
              "-C", f"{name}-agent"],
             as_user=name,
         )
-    with open(key + ".pub") as f:
-        return f.read().strip()
-
-
-def _chown_tree(path, uid, gid):
-    os.chown(path, uid, gid)
-    for root, dirs, files in os.walk(path):
-        for p in dirs + files:
-            try:
-                os.chown(os.path.join(root, p), uid, gid)
-            except OSError:
-                pass
+    return run(["cat", key + ".pub"], as_user=name).stdout.strip()
 
 
 def check_human_homes(agent, humans):
