@@ -81,6 +81,13 @@ def run(cmd, as_user=None, check=True):
     return r
 
 
+def ensure_dir(path, mode):
+    """mkdir -p with an explicit mode, independent of the caller's umask."""
+    os.makedirs(path, exist_ok=True)
+    os.chmod(path, mode)
+    return os.stat(path)
+
+
 # --------------------------------------------------------------------------
 # marked-block parsing (shared by /etc/doas.conf and human rc files)
 # --------------------------------------------------------------------------
@@ -195,13 +202,13 @@ class State:
         self.agents_dir = os.path.join(state_dir, "agents")
 
     def lock(self):
-        os.makedirs(self.dir, mode=0o755, exist_ok=True)
+        ensure_dir(self.dir, 0o755)
         fd = os.open(os.path.join(self.dir, "provision.lock"), os.O_CREAT, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)  # serialize concurrent runs
         return fd
 
     def save_agent(self, rec):
-        os.makedirs(self.agents_dir, mode=0o755, exist_ok=True)
+        ensure_dir(self.agents_dir, 0o755)
         path = os.path.join(self.agents_dir, rec["name"] + ".json")
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
@@ -355,8 +362,7 @@ def render_wrapper(cfg, agent, command, target):
 
 
 def install_wrapper(cfg, command, content):
-    os.makedirs(cfg.shim_dir, mode=0o755, exist_ok=True)
-    st = os.stat(cfg.shim_dir)
+    st = ensure_dir(cfg.shim_dir, 0o755)
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         die(f"shim dir {cfg.shim_dir} must not be group/other-writable")
     path = os.path.join(cfg.shim_dir, command)
