@@ -245,7 +245,12 @@ def set_membership(user, group, member):
 def reconcile_group(cfg):
     """Provisioning fully owns supplementary membership of shared_group."""
     ensure_group(cfg.shared_group)
-    allowed = set(cfg.existing_humans()) | set(cfg.agents)
+    allowed = set(cfg.existing_humans())
+    for a in cfg.agents:
+        if Setup._user_exists(a):
+            allowed.add(a)
+        else:
+            warn(f"agent {a!r} has no Unix account yet; skipping its group membership")
     for u in group_members(cfg.shared_group):
         if u not in allowed:
             warn(f"revoking stale {cfg.shared_group} membership of {u!r}")
@@ -435,7 +440,8 @@ def rewrite_doas_conf(rules):
 # --------------------------------------------------------------------------
 
 def provision_agent(cfg, state, name, command, humans, summary):
-    ensure_agent_user(name)
+    # Account exists and group membership is final at this point (see
+    # cmd_provision), so check_human_homes observes the effective access.
     ensure_agent_git(name)
     pubkey = ensure_agent_ssh_key(name)
     docker_warning(name)
@@ -477,13 +483,19 @@ def cmd_provision(cfg, only):
     state = State(cfg.state_dir)
     lock_fd = state.lock()
     try:
+        if only is not None and only not in cfg.agents:
+            die(f"unknown agent {only!r}; known: {', '.join(sorted(cfg.agents)) or '(none)'}")
+        targets = list(cfg.agents.items()) if only is None else [(only, cfg.agents[only])]
+
         humans = cfg.existing_humans()
+        # Order matters for a fresh system: accounts first, then group
+        # membership (which needs the accounts), then everything that
+        # should observe the final membership (home-access check).
+        for name, _ in targets:
+            ensure_agent_user(name)
         reconcile_group(cfg)
         prune_removed(cfg, state, lambda agent: remove_agent(cfg, state, agent))
 
-        if only is not None and only not in cfg.agents:
-            die(f"unknown agent {only!r}; known: {', '.join(sorted(cfg.agents)) or '(none)'}")
-        targets = cfg.agents.items() if only is None else [(only, cfg.agents[only])]
         summary = []
         for name, command in targets:
             provision_agent(cfg, state, name, command, humans, summary)
