@@ -251,7 +251,7 @@ def reconcile_group(cfg):
             warn(f"revoking stale {cfg.shared_group} membership of {u!r}")
             set_membership(u, cfg.shared_group, member=False)
     for u in sorted(allowed):
-        set_membership(u, cfg.shared_group, member=is_member(u, cfg.shared_group))
+        set_membership(u, cfg.shared_group, member=True)
 
 
 def ensure_agent_user(name):
