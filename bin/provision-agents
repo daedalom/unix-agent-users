@@ -156,6 +156,14 @@ class Setup:
                 die(f"agents {seen[cmd]!r} and {name!r} both claim command {cmd!r}; "
                     f"each command can be wrapped for one agent only")
             seen[cmd] = name
+        # These values are spliced into single-quoted sh strings in the
+        # wrapper template; a quote or newline would break out of them.
+        for key, val in (("shim_dir", self.shim_dir), ("target_path", self.target_path),
+                         ("state_dir", self.state_dir)):
+            if not val.startswith("/"):
+                die(f"{key} must be an absolute path: {val!r}")
+            if "'" in val or any(c.isspace() for c in val):
+                die(f"{key} must not contain quotes or whitespace: {val!r}")
         here = os.path.dirname(os.path.abspath(__file__))
         self.template = os.path.join(here, "..", "wrapper", "wrapper-template.sh")
 
