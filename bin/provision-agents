@@ -61,10 +61,17 @@ def info(msg):
 
 
 def run(cmd, as_user=None, check=True):
-    """Run a command, optionally via runuser. Returns CompletedProcess."""
+    """Run a command, optionally via runuser. Returns CompletedProcess.
+
+    Commands run as another user start from "/" rather than inheriting the
+    caller's cwd: root typically provisions from /root (mode 0700), and
+    programs such as git abort when their cwd is unreadable.
+    """
+    cwd = None
     if as_user:
         cmd = ["runuser", "-u", as_user, "--"] + cmd
-    r = subprocess.run(cmd, text=True, capture_output=True)
+        cwd = "/"
+    r = subprocess.run(cmd, text=True, capture_output=True, cwd=cwd)
     if check and r.returncode != 0:
         raise RuntimeError(
             "command failed ({}): {}\n{}".format(
