@@ -105,6 +105,22 @@ live in a dedicated root-owned **shim directory** (default
 3. `provision-agents status` detects modified wrappers or relocated targets,
    and re-running `provision --all` repairs them.
 
+**The real binary must be installed system-wide.** The wrapper resolves the
+binary as the *human* (before switching to the agent), so it must be on
+`target_path` and executable by the agent account -- e.g. a root-owned
+`/usr/local/bin/claude`. Claude Code's native installer defaults to the
+calling user's `~/.local/bin`, which is neither on `target_path` nor readable
+by the agent; install it with a system-wide prefix instead (or symlink the
+human's copy into `/usr/local/bin` only if the agent can read and execute it).
+The upside is that the agent cannot self-update the binary, which is exactly
+the tampering class the shim dir exists to prevent. This differs from the
+original shell wrapper, which resolved the binary *as the agent* and thus let
+each agent account keep its own installation.
+
+**PATH is only prepended for shells that read `~/.bashrc` / `~/.profile`.**
+Terminals launched by IDEs or desktop sessions that skip those files will not
+see the shim dir; add it to their PATH yourself in that case.
+
 No `AGENT.md`/`CLAUDE.md` files are generated; workflow documentation lives
 here in the README only.
 
