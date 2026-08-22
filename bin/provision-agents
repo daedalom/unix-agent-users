@@ -376,14 +376,16 @@ def render_wrapper(cfg, agent, command, target):
     return tpl
 
 
-def install_wrapper(cfg, command, content):
-    st = ensure_dir(cfg.shim_dir, 0o755)
-    # The security of every wrapper rests on nobody but root being able to
-    # replace files here or the directory itself: check owner and mode of
-    # the shim dir and of every ancestor, and refuse symlinked components.
-    if os.path.realpath(cfg.shim_dir) != os.path.abspath(cfg.shim_dir):
-        die(f"shim dir {cfg.shim_dir} must not contain symlinks")
-    d = os.path.abspath(cfg.shim_dir)
+def check_root_owned_path(path):
+    """Die unless PATH and every ancestor are root-owned, non-writable by
+    others (sticky dirs excepted) and free of symlinks.
+
+    The security of every wrapper rests on nobody but root being able to
+    replace files in the shim dir or the directory itself.
+    """
+    if os.path.realpath(path) != os.path.abspath(path):
+        die(f"{path} must not contain symlinks")
+    d = os.path.abspath(path)
     while True:
         st = os.lstat(d)
         if st.st_uid != 0:
@@ -394,6 +396,11 @@ def install_wrapper(cfg, command, content):
         if parent == d:
             break
         d = parent
+
+
+def install_wrapper(cfg, command, content):
+    ensure_dir(cfg.shim_dir, 0o755)
+    check_root_owned_path(cfg.shim_dir)
     path = os.path.join(cfg.shim_dir, command)
     fd, tmp = tempfile.mkstemp(dir=cfg.shim_dir, prefix=".wrap-")
     with os.fdopen(fd, "w") as f:

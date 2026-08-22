@@ -13,6 +13,7 @@ semantics, plus the previously open TODO items solved (see below).
     bin/provision-agents           provision / remove / status (Python)
     bin/check-deps                 dependency checker, optional --install
     wrapper/wrapper-template.sh    doas wrapper template (rendered per agent)
+    tests/test_provision.py        root-free unit tests (python3 -m unittest discover -s tests)
 
 Provisioning is idempotent: re-running converges the system toward
 `setup.conf` and doubles as the repair/upgrade mechanism.
