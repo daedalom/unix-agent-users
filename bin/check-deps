@@ -17,7 +17,7 @@ import sys
 
 # binary -> packages per package manager
 PKGS = {
-    "doas":       {"dnf": "doas", "apt": "doas", "zypper": "opendoas", "pacman": "opendoas"},
+    "doas":       {"dnf": "opendoas", "apt": "doas", "zypper": "opendoas", "pacman": "opendoas"},
     "git":        {"dnf": "git", "apt": "git", "zypper": "git", "pacman": "git"},
     "ssh-keygen": {"dnf": "openssh-clients", "apt": "openssh-client",
                    "zypper": "openssh", "pacman": "openssh"},
