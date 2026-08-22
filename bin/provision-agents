@@ -340,7 +340,7 @@ def check_human_homes(agent, humans):
 
 def docker_warning(agent):
     try:
-        gr = grp.getgrnam("docker")
+        grp.getgrnam("docker")
     except KeyError:
         return
     if is_member(agent, "docker"):
