@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""agents-setup -- isolation infrastructure for coding agents on one Linux box.
+
+Python re-implementation of the original shell provisioner (see README.md).
+Declarative config in config/setup.conf; idempotent convergence; serialized
+runs via flock; atomic, doas -C-validated /etc/doas.conf updates.
+
+Subcommands:
+    provision --all | --agent NAME   converge toward the config (also repairs)
+    remove    (--agent|--human) NAME revoke managed artifacts, keep accounts
+    status                           report state and drift
+"""
+
+import argparse
+import configparser
+import fcntl
+import grp
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+MARK_BEGIN = "#>>> agents-setup begin >>>"
+MARK_END = "#<<< agents-setup end <<<"
+BLOCK_COMMENT = "# managed by agents-setup; edit config/setup.conf, then rerun provision-agents"
+
+VALID_NAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+DOAS_CONF = "/etc/doas.conf"
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg):
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def info(msg):
+    print(f"==> {msg}")
+
+
+def run(cmd, as_user=None, check=True):
+    """Run a command, optionally via runuser. Returns CompletedProcess."""
+    if as_user:
+        cmd = ["runuser", "-u", as_user, "--"] + cmd
+    r = subprocess.run(cmd, text=True, capture_output=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(
+            "command failed ({}): {}\n{}".format(
+                r.returncode, " ".join(cmd), (r.stderr or "").strip()
+            )
+        )
+    return r
+
+
+# --------------------------------------------------------------------------
+# marked-block parsing (shared by /etc/doas.conf and human rc files)
+# --------------------------------------------------------------------------
+
+def parse_block(text):
+    """Locate the single managed block. Returns (lines, span_or_None).
+
+    Raises on partial/duplicated/malformed marker blocks.
+    """
+    lines = text.splitlines()
+    begins = [i for i, l in enumerate(lines) if l.strip() == MARK_BEGIN]
+    ends = [i for i, l in enumerate(lines) if l.strip() == MARK_END]
+    if not begins and not ends:
+        return lines, None
+    if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+        raise RuntimeError(
+            "malformed agents-setup marker block "
+            "(partial, duplicated, or out of order); fix it manually first"
+        )
+    return lines, (begins[0], ends[0])
+
+
+def apply_block(text, body_lines):
+    """Return text with the managed block replaced/inserted at the top."""
+    new_block = [MARK_BEGIN, BLOCK_COMMENT] + body_lines + [MARK_END]
+    lines, span = parse_block(text)
+    if span is None:
+        return "\n".join(new_block + [""] + lines).rstrip("\n") + "\n"
+    return "\n".join(lines[: span[0]] + new_block + lines[span[1] + 1 :]) + "\n"
+
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+class Setup:
+    def __init__(self, path):
+        cp = configparser.ConfigParser(interpolation=None)
+        if not cp.read(path):
+            die(f"cannot read config {path}")
+        try:
+            s = cp["setup"]
+            self.shared_group = s.get("shared_group", "agents").strip()
+            self.state_dir = s.get("state_dir", "/var/lib/nix-agents").strip()
+            self.shim_dir = s.get("shim_dir", "/usr/local/lib/agent-shims/bin").strip()
+            self.target_path = s.get(
+                "target_path", "/usr/local/bin:/usr/bin:/bin"
+            ).strip()
+            self.manage_human_path = s.getboolean("manage_human_path", fallback=True)
+            self.nopass = s.getboolean("nopass", fallback=True)
+            humans = cp["humans"].get("members", fallback="")
+            self.humans = humans.split()
+            self.agents = {}
+            for name, cmd in cp["agents"].items():
+                cmd = cmd.strip() or name
+                self.agents[name] = cmd
+        except (KeyError, ValueError) as e:
+            die(f"bad config {path}: {e}")
+        for n in list(self.humans) + list(self.agents):
+            if not VALID_NAME.match(n):
+                die(f"invalid account name in config: {n!r}")
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.template = os.path.join(here, "..", "wrapper", "wrapper-template.sh")
+
+    def existing_humans(self):
+        ok = []
+        for h in self.humans:
+            if self._user_exists(h):
+                ok.append(h)
+            else:
+                warn(f"human {h!r} has no Unix account; skipping its rules")
+        return ok
+
+    @staticmethod
+    def _user_exists(name):
+        try:
+            pwd.getpwnam(name)
+            return True
+        except KeyError:
+            return False
+
+    def resolve_target(self, command, wrapper_path=None):
+        """Find the real binary in target_path (mirrors wrapper find_bin)."""
+        skip_real = os.path.realpath(wrapper_path) if wrapper_path else None
+        for d in self.target_path.split(":"):
+            if not d or os.path.abspath(d) == os.path.abspath(self.shim_dir):
+                continue
+            cand = os.path.join(d, command)
+            if os.access(cand, os.X_OK):
+                real = os.path.realpath(cand)
+                if skip_real and real == skip_real:
+                    continue
+                return cand
+        return ""
+
+
+# --------------------------------------------------------------------------
+# state & locking
+# --------------------------------------------------------------------------
+
+class State:
+    def __init__(self, state_dir):
+        self.dir = state_dir
+        self.agents_dir = os.path.join(state_dir, "agents")
+
+    def lock(self):
+        os.makedirs(self.dir, mode=0o755, exist_ok=True)
+        fd = os.open(os.path.join(self.dir, "provision.lock"), os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # serialize concurrent runs
+        return fd
+
+    def save_agent(self, rec):
+        os.makedirs(self.agents_dir, mode=0o755, exist_ok=True)
+        path = os.path.join(self.agents_dir, rec["name"] + ".json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(rec, f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+
+    def load_agents(self):
+        if not os.path.isdir(self.agents_dir):
+            return {}
+        out = {}
+        for fn in sorted(os.listdir(self.agents_dir)):
+            if fn.endswith(".json"):
+                with open(os.path.join(self.agents_dir, fn)) as f:
+                    rec = json.load(f)
+                out[rec["name"]] = rec
+        return out
+
+    def drop_agent(self, name):
+        path = os.path.join(self.agents_dir, name + ".json")
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+# --------------------------------------------------------------------------
+# users, groups
+# --------------------------------------------------------------------------
+
+def ensure_group(name):
+    try:
+        grp.getgrnam(name)
+    except KeyError:
+        info(f"creating group {name}")
+        run(["groupadd", "--system", name])
+
+
+def group_members(name):
+    return list(grp.getgrnam(name).gr_mem)
+
+
+def is_member(user, group):
+    pw = pwd.getpwnam(user)
+    gr = grp.getgrnam(group)
+    return gr.gr_gid == pw.pw_gid or user in gr.gr_mem
+
+
+def set_membership(user, group, member):
+    if member != is_member(user, group):
+        verb = "adding" if member else "removing"
+        info(f"{verb} {user} {'to' if member else 'from'} group {group}")
+        if member:
+            run(["usermod", "-aG", group, user])
+        else:
+            run(["gpasswd", "-d", user, group], check=False)
+
+
+def reconcile_group(cfg):
+    """Provisioning fully owns supplementary membership of shared_group."""
+    ensure_group(cfg.shared_group)
+    allowed = set(cfg.existing_humans()) | set(cfg.agents)
+    for u in group_members(cfg.shared_group):
+        if u not in allowed:
+            warn(f"revoking stale {cfg.shared_group} membership of {u!r}")
+            set_membership(u, cfg.shared_group, member=False)
+    for u in sorted(allowed):
+        set_membership(u, cfg.shared_group, member=is_member(u, cfg.shared_group))
+
+
+def ensure_agent_user(name):
+    if not Setup._user_exists(name):
+        info(f"creating agent account {name}")
+        run(["useradd", "-m", "-s", "/bin/bash", "-c", f"{name} (agent)", name])
+    home = pwd.getpwnam(name).pw_dir
+    if not os.path.isdir(home):
+        die(f"agent {name}: home {home} missing; refusing to continue")
+
+
+def ensure_agent_git(name):
+    # Attributable commits, per audit section of README.
+    run(["git", "config", "--global", "user.name", f"{name} (agent)"], as_user=name)
+    run(["git", "config", "--global", "user.email", f"{name}@agents.local"], as_user=name)
+
+
+def ensure_agent_ssh_key(name):
+    pw = pwd.getpwnam(name)
+    sshdir = os.path.join(pw.pw_dir, ".ssh")
+    key = os.path.join(sshdir, "id_ed25519")
+    if not os.path.isdir(sshdir):
+        os.makedirs(sshdir, mode=0o700)
+    _chown_tree(sshdir, pw.pw_uid, pw.pw_gid)
+    os.chmod(sshdir, 0o700)
+    if not os.path.exists(key):
+        info(f"generating ed25519 deploy key for {name}")
+        run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key,
+             "-C", f"{name}-agent"],
+            as_user=name,
+        )
+    with open(key + ".pub") as f:
+        return f.read().strip()
+
+
+def _chown_tree(path, uid, gid):
+    os.chown(path, uid, gid)
+    for root, dirs, files in os.walk(path):
+        for p in dirs + files:
+            try:
+                os.chown(os.path.join(root, p), uid, gid)
+            except OSError:
+                pass
+
+
+def check_human_homes(agent, humans):
+    """Kernel-level check that the agent cannot reach human homes."""
+    agent_home = pwd.getpwnam(agent).pw_dir
+    for h in humans:
+        home = pwd.getpwnam(h).pw_dir
+        if os.path.realpath(home) == os.path.realpath(agent_home):
+            continue
+        probes = {"readable": ["-r"], "traversable": ["-x"], "writable": ["-w"]}
+        hits = [lbl for lbl, flag in probes.items()
+                if run(["test"] + flag + [home], as_user=agent, check=False).returncode == 0]
+        if hits:
+            warn(
+                f"agent {agent} can access {h}'s home ({', '.join(hits)}): "
+                f"fix ownership/mode/ACLs before running an untrusted agent"
+            )
+
+
+def docker_warning(agent):
+    try:
+        gr = grp.getgrnam("docker")
+    except KeyError:
+        return
+    if is_member(agent, "docker"):
+        warn(f"agent {agent} is in the docker group (root-equivalent); remove it "
+             f"and use rootless podman instead")
+
+
+# --------------------------------------------------------------------------
+# wrappers (root-owned shim dir -> survives vendor self-updaters)
+# --------------------------------------------------------------------------
+
+def render_wrapper(cfg, agent, command, target):
+    with open(cfg.template) as f:
+        tpl = f.read()
+    for k, v in [
+        ("@AGENT@", agent),
+        ("@COMMAND@", command),
+        ("@SHIM_DIR@", cfg.shim_dir),
+        ("@TARGET_PATH@", cfg.target_path),
+        ("@TARGET@", target),
+    ]:
+        tpl = tpl.replace(k, v)
+    if "@AGENT@" in tpl or "@COMMAND@" in tpl:
+        die("wrapper template contains unresolved placeholders")
+    return tpl
+
+
+def install_wrapper(cfg, command, content):
+    os.makedirs(cfg.shim_dir, mode=0o755, exist_ok=True)
+    st = os.stat(cfg.shim_dir)
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        die(f"shim dir {cfg.shim_dir} must not be group/other-writable")
+    path = os.path.join(cfg.shim_dir, command)
+    fd, tmp = tempfile.mkstemp(dir=cfg.shim_dir, prefix=".wrap-")
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    os.chmod(tmp, 0o755)
+    os.chown(tmp, 0, 0)
+    os.replace(tmp, path)  # atomic
+    return path
+
+
+def sha256_text(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def manage_human_rc(cfg, human):
+    """Prepend shim dir to human PATH via managed rc block."""
+    if not cfg.manage_human_path:
+        return
+    body = [
+        "# prepend root-managed agent wrapper directory to PATH",
+        'case ":$PATH:" in',
+        f'    *":{cfg.shim_dir}:"*) ;;',
+        f'    *) PATH="{cfg.shim_dir}:$PATH"; export PATH ;;',
+        "esac",
+    ]
+    home = pwd.getpwnam(human).pw_dir
+    for rc in (".bashrc", ".profile"):
+        path = os.path.join(home, rc)
+        try:
+            st = os.stat(path)
+            with open(path) as f:
+                old = f.read()
+        except FileNotFoundError:
+            if rc == ".profile":
+                continue  # only create .bashrc
+            st, old = None, ""
+        new = apply_block(old, body)
+        if new != old:
+            info(f"updating PATH block in ~{human}/{rc}")
+            tmp = path + ".agents-setup.tmp"
+            with open(tmp, "w") as f:
+                f.write(new)
+            if st:
+                os.chown(tmp, st.st_uid, st.st_gid)
+                os.chmod(tmp, stat.S_IMODE(st.st_mode))
+            else:
+                shutil.chown(tmp, user=human)
+                os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# doas.conf management
+# --------------------------------------------------------------------------
+
+def build_doas_rules(cfg, humans):
+    rules = []
+    for h in humans:
+        for a in cfg.agents:
+            rules.append(f"permit{' nopass' if cfg.nopass else ''} {h} as {a}")
+    return rules
+
+
+def rewrite_doas_conf(rules):
+    """Replace the managed block, validate with doas -C, atomically install."""
+    try:
+        with open(DOAS_CONF) as f:
+            old = f.read()
+        st = os.stat(DOAS_CONF)
+        mode = stat.S_IMODE(st.st_mode)
+    except FileNotFoundError:
+        old, mode = "", 0o600
+    try:
+        new = apply_block(old, rules)
+    except RuntimeError as e:
+        die(str(e))
+    if new == old:
+        return False
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(DOAS_CONF), prefix=".doas.conf.")
+    with os.fdopen(fd, "w") as f:
+        f.write(new)
+    os.chmod(tmp, mode)
+    os.chown(tmp, 0, 0)
+    r = subprocess.run(["doas", "-C", tmp], capture_output=True, text=True)
+    if r.returncode != 0:
+        os.unlink(tmp)
+        die(f"candidate doas.conf failed `doas -C`: {(r.stderr or '').strip()}")
+    os.replace(tmp, DOAS_CONF)  # atomic
+    return True
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def provision_agent(cfg, state, name, command, humans, summary):
+    ensure_agent_user(name)
+    ensure_agent_git(name)
+    pubkey = ensure_agent_ssh_key(name)
+    docker_warning(name)
+    check_human_homes(name, humans)
+
+    wrapper_path = os.path.join(cfg.shim_dir, command)
+    target = cfg.resolve_target(command, wrapper_path)
+    if not target:
+        warn(f"command {command!r} for agent {name!r} not found in target_path; "
+             f"install it later -- the wrapper resolves it at runtime")
+    content = render_wrapper(cfg, name, command, target)
+    install_wrapper(cfg, command, content)
+
+    old = state.load_agents().get(name, {})
+    if old.get("wrapper_sha256") != sha256_text(content):
+        info(f"installed wrapper {wrapper_path} -> {target or '(unresolved)'}")
+
+    state.save_agent({
+        "name": name,
+        "command": command,
+        "target": target,
+        "pubkey": pubkey,
+        "wrapper_path": wrapper_path,
+        "wrapper_sha256": sha256_text(content),
+    })
+    summary.append((name, target, pubkey))
+
+
+def prune_removed(cfg, state, do_removal):
+    """Converge away agents recorded in state but gone from the config."""
+    for name in sorted(set(state.load_agents()) - set(cfg.agents)):
+        info(f"agent {name!r} no longer in config; revoking its managed setup")
+        do_removal(agent=name)
+
+
+def cmd_provision(cfg, only):
+    if os.geteuid() != 0:
+        die("must run as root")
+    state = State(cfg.state_dir)
+    lock_fd = state.lock()
+    try:
+        humans = cfg.existing_humans()
+        reconcile_group(cfg)
+        prune_removed(cfg, state, lambda agent: remove_agent(cfg, state, agent))
+
+        if only is not None and only not in cfg.agents:
+            die(f"unknown agent {only!r}; known: {', '.join(sorted(cfg.agents)) or '(none)'}")
+        targets = cfg.agents.items() if only is None else [(only, cfg.agents[only])]
+        summary = []
+        for name, command in targets:
+            provision_agent(cfg, state, name, command, humans, summary)
+        for h in humans:
+            manage_human_rc(cfg, h)
+
+        changed = rewrite_doas_conf(build_doas_rules(cfg, humans))
+        info("doas.conf " + ("updated" if changed else "already current"))
+
+        # stale/untracked wrappers in the shim dir
+        tracked = {os.path.basename(r["wrapper_path"]) for r in state.load_agents().values()}
+        for fn in sorted(os.listdir(cfg.shim_dir)) if os.path.isdir(cfg.shim_dir) else []:
+            if not fn.startswith(".") and fn not in tracked:
+                warn(f"untracked file in shim dir: {os.path.join(cfg.shim_dir, fn)}")
+
+        print("\nAgent sessions:")
+        for name, target, pubkey in summary:
+            print(f"  {name}: wrapper for {target or '(not installed yet)'}")
+            print(f"    ssh public key (deploy-key scope only!):\n      {pubkey}")
+        print("\nStart an agent session by typing its command, e.g.: claude")
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def remove_agent(cfg, state, name):
+    recs = state.load_agents()
+    rec = recs.get(name)
+    if rec and os.path.exists(rec["wrapper_path"]):
+        cur = None
+        try:
+            with open(rec["wrapper_path"]) as f:
+                cur = sha256_text(f.read())
+        except OSError:
+            pass
+        if cur == rec.get("wrapper_sha256"):
+            info(f"removing wrapper {rec['wrapper_path']}")
+            os.unlink(rec["wrapper_path"])
+        else:
+            warn(f"wrapper {rec['wrapper_path']} was modified; leaving it alone")
+    if Setup._user_exists(name):
+        set_membership(name, cfg.shared_group, member=False)
+    state.drop_agent(name)
+
+
+def remove_human(cfg, name):
+    if Setup._user_exists(name):
+        set_membership(name, cfg.shared_group, member=False)
+
+
+def cmd_remove(cfg, kind, names):
+    if os.geteuid() != 0:
+        die("must run as root")
+    state = State(cfg.state_dir)
+    lock_fd = state.lock()
+    try:
+        for n in names:
+            if kind == "agent":
+                if n in cfg.agents:
+                    die(f"{n!r} is still in the config; remove it there first")
+                remove_agent(cfg, state, n)
+                info(f"agent {n!r} removed (account and home deliberately retained)")
+            else:
+                if n in cfg.humans:
+                    die(f"{n!r} is still in the config; remove it there first")
+                remove_human(cfg, n)
+                info(f"human {n!r} removed from managed group")
+        humans = cfg.existing_humans()
+        rewrite_doas_conf(build_doas_rules(cfg, humans))
+        info("done. Note: group membership is cached by the kernel; terminate "
+             "removed sessions / re-login to take effect.")
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def cmd_status(cfg):
+    state = State(cfg.state_dir)
+    recs = state.load_agents()
+    humans = cfg.existing_humans()
+    try:
+        members = group_members(cfg.shared_group)
+    except KeyError:
+        members = "(group does not exist yet)"
+    print(f"group {cfg.shared_group}: members = {members}")
+    print(f"shim dir: {cfg.shim_dir}")
+    for name in sorted(set(recs) | set(cfg.agents)):
+        rec = recs.get(name, {})
+        command = rec.get("command", cfg.agents.get(name, "?"))
+        wp = rec.get("wrapper_path") or os.path.join(cfg.shim_dir, command)
+        ok_wrap = "?"
+        if os.path.exists(wp):
+            try:
+                with open(wp) as f:
+                    ok_wrap = "ok" if sha256_text(f.read()) == rec.get("wrapper_sha256") \
+                        else "MODIFIED"
+            except OSError:
+                ok_wrap = "unreadable"
+        else:
+            ok_wrap = "MISSING"
+        target_now = cfg.resolve_target(command, wp)
+        drift = ""
+        if target_now != rec.get("target"):
+            drift += f"  [target moved: now {target_now or 'unresolved'}]"
+        print(f"agent {name}: command={command} wrapper={ok_wrap}{drift}")
+    rules_expected = len(build_doas_rules(cfg, humans))
+    print(f"expected doas rules: {rules_expected} ({len(humans)} humans x {len(cfg.agents)} agents)")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="provision-agents",
+                                 description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-c", "--config", default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "config", "setup.conf"))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p_prov = sub.add_parser("provision", help="converge system toward config")
+    g = p_prov.add_mutually_exclusive_group()
+    g.add_argument("--all", action="store_true")
+    g.add_argument("--agent", metavar="NAME")
+    p_rm = sub.add_parser("remove", help="revoke managed artifacts (keeps accounts)")
+    p_rm.add_argument("--agent", action="append", default=[], metavar="NAME")
+    p_rm.add_argument("--human", action="append", default=[], metavar="NAME")
+    sub.add_parser("status", help="report state and drift")
+    args = ap.parse_args()
+
+    cfg = Setup(args.config)
+    if args.cmd == "provision":
+        if not args.all and not args.agent:
+            die("choose --all (full convergence) or --agent NAME")
+        cmd_provision(cfg, None if args.all else args.agent)
+    elif args.cmd == "remove":
+        if not args.agent and not args.human:
+            die("nothing to remove: use --agent NAME and/or --human NAME")
+        cmd_remove(cfg, "agent", args.agent)
+        if args.human:
+            cmd_remove(cfg, "human", args.human)
+    elif args.cmd == "status":
+        cmd_status(cfg)
+
+
+if __name__ == "__main__":
+    main()

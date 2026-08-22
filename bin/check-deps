@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""check-deps -- verify (and optionally install) dependencies for agents-setup.
+
+Checks required tools (doas, git, ssh, shadow-utils) and recommended ones
+(tmux for wrapper --tmux sessions, podman for container workloads).
+
+Usage:
+    check-deps                 report status; exit 1 if a REQUIRED tool is missing
+    check-deps --install       install everything that is missing
+                               (uses doas/sudo to escalate if not root)
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+
+# binary -> packages per package manager
+PKGS = {
+    "doas":       {"dnf": "doas", "apt": "doas", "zypper": "opendoas", "pacman": "opendoas"},
+    "git":        {"dnf": "git", "apt": "git", "zypper": "git", "pacman": "git"},
+    "ssh-keygen": {"dnf": "openssh-clients", "apt": "openssh-client",
+                   "zypper": "openssh", "pacman": "openssh"},
+    "usermod":    {"dnf": "shadow-utils", "apt": "passwd",
+                   "zypper": "shadow", "pacman": "shadow"},
+    "gpasswd":    None,  # same package as usermod
+    "runuser":    {"dnf": "util-linux", "apt": "util-linux",
+                   "zypper": "util-linux", "pacman": "util-linux"},
+    # recommended / feature-gated
+    "tmux":       {"dnf": "tmux", "apt": "tmux", "zypper": "tmux", "pacman": "tmux"},
+    "podman":     {"dnf": "podman", "apt": "podman", "zypper": "podman", "pacman": "podman"},
+}
+
+REQUIRED = ["doas", "git", "ssh-keygen", "usermod", "gpasswd", "runuser"]
+RECOMMENDED = ["tmux", "podman"]
+
+MANAGERS = {
+    "dnf":     ["install", "-y"],
+    "apt-get": ["install", "-y"],
+    "zypper":  ["--non-interactive", "install"],
+    "pacman":  ["-S", "--noconfirm"],
+}
+
+
+def detect_manager():
+    for m in MANAGERS:
+        path = shutil.which(m)
+        if path:
+            return m, path
+    return None, None
+
+
+def find(binary):
+    return shutil.which(binary)
+
+
+def main():
+    install = "--install" in sys.argv[1:]
+    missing_req, missing_rec = [], []
+
+    print(f"{'CHECK':<12} {'STATUS':<10} NOTE")
+    for binary in REQUIRED + RECOMMENDED:
+        kind = "required" if binary in REQUIRED else "recommended"
+        note = ""
+        if binary == "tmux":
+            note = "needed for: <wrapper> --tmux"
+        elif binary == "podman":
+            note = "rootless container workloads (never use docker group)"
+        found = find(binary)
+        status = "ok" if found else f"missing ({kind})"
+        print(f"{binary:<12} {status:<10} {note}")
+        if not found:
+            (missing_req if kind == "required" else missing_rec).append(binary)
+
+    if not install:
+        if missing_req or missing_rec:
+            print("\ninstall missing tools with: check-deps --install")
+        return 1 if missing_req else 0
+
+    mgr_name, mgr_path = detect_manager()
+    if not mgr_name:
+        print("error: no supported package manager found "
+              "(dnf/apt-get/zypper/pacman)", file=sys.stderr)
+        return 1
+
+    todo = [b for b in missing_req + missing_rec if PKGS.get(b)]
+    # gpasswd ships with the same package as usermod
+    pkgs, seen = [], set()
+    for b in todo:
+        p = PKGS[b] or PKGS["usermod"]
+        name = p.get(mgr_name)
+        if name and name not in seen:
+            seen.add(name)
+            pkgs.append(name)
+    if not pkgs:
+        print("nothing to install")
+        return 0
+
+    cmd = [mgr_path] + MANAGERS[mgr_name] + pkgs
+    if os.geteuid() != 0:
+        esc = find("doas") or find("sudo")
+        if not esc:
+            print("error: not root and neither doas nor sudo available",
+                  file=sys.stderr)
+            return 1
+        cmd = [esc] + cmd
+
+    print(f"\nrunning: {' '.join(cmd)}")
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        print("error: installation failed", file=sys.stderr)
+        return 1
+
+    print()
+    still_missing = [b for b in missing_req if not find(b)]
+    for b in still_missing:
+        print(f"error: {b} still missing after install", file=sys.stderr)
+    return 1 if still_missing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
