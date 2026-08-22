@@ -33,7 +33,6 @@ import json
 import os
 import pwd
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -404,7 +403,8 @@ def manage_human_rc(cfg, human):
         f'    *) PATH="{cfg.shim_dir}:$PATH"; export PATH ;;',
         "esac",
     ]
-    home = pwd.getpwnam(human).pw_dir
+    pw = pwd.getpwnam(human)
+    home = pw.pw_dir
     for rc in (".bashrc", ".profile"):
         path = os.path.join(home, rc)
         try:
@@ -421,11 +421,13 @@ def manage_human_rc(cfg, human):
             tmp = path + ".agents-setup.tmp"
             with open(tmp, "w") as f:
                 f.write(new)
+            # Existing file: keep its owner, group and mode exactly.
+            # New file: the human's uid and primary gid, never root's.
             if st:
                 os.chown(tmp, st.st_uid, st.st_gid)
                 os.chmod(tmp, stat.S_IMODE(st.st_mode))
             else:
-                shutil.chown(tmp, user=human)
+                os.chown(tmp, pw.pw_uid, pw.pw_gid)
                 os.chmod(tmp, 0o644)
             os.replace(tmp, path)
 
