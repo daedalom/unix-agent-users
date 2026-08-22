@@ -599,23 +599,24 @@ def remove_human(cfg, name):
         set_membership(name, cfg.shared_group, member=False)
 
 
-def cmd_remove(cfg, kind, names):
+def cmd_remove(cfg, agents, humans_to_remove):
     if os.geteuid() != 0:
         die("must run as root")
+    for n in agents:
+        if n in cfg.agents:
+            die(f"agent {n!r} is still in the config; remove it there first")
+    for n in humans_to_remove:
+        if n in cfg.humans:
+            die(f"human {n!r} is still in the config; remove it there first")
     state = State(cfg.state_dir)
     lock_fd = state.lock()
     try:
-        for n in names:
-            if kind == "agent":
-                if n in cfg.agents:
-                    die(f"{n!r} is still in the config; remove it there first")
-                remove_agent(cfg, state, n)
-                info(f"agent {n!r} removed (account and home deliberately retained)")
-            else:
-                if n in cfg.humans:
-                    die(f"{n!r} is still in the config; remove it there first")
-                remove_human(cfg, n)
-                info(f"human {n!r} removed from managed group")
+        for n in agents:
+            remove_agent(cfg, state, n)
+            info(f"agent {n!r} removed (account and home deliberately retained)")
+        for n in humans_to_remove:
+            remove_human(cfg, n)
+            info(f"human {n!r} removed from managed group")
         humans = cfg.existing_humans()
         rewrite_doas_conf(build_doas_rules(cfg, humans))
         info("done. Note: group membership is cached by the kernel; terminate "
@@ -683,9 +684,7 @@ def main():
     elif args.cmd == "remove":
         if not args.agent and not args.human:
             die("nothing to remove: use --agent NAME and/or --human NAME")
-        cmd_remove(cfg, "agent", args.agent)
-        if args.human:
-            cmd_remove(cfg, "human", args.human)
+        cmd_remove(cfg, args.agent, args.human)
     elif args.cmd == "status":
         cmd_status(cfg)
 
