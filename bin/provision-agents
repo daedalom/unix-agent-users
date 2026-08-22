@@ -142,6 +142,14 @@ class Setup:
         for n in list(self.humans) + list(self.agents):
             if not VALID_NAME.match(n):
                 die(f"invalid account name in config: {n!r}")
+        seen = {}
+        for name, cmd in self.agents.items():
+            if "/" in cmd or cmd in (".", ".."):
+                die(f"agent {name!r}: command {cmd!r} must be a bare name")
+            if cmd in seen:
+                die(f"agents {seen[cmd]!r} and {name!r} both claim command {cmd!r}; "
+                    f"each command can be wrapped for one agent only")
+            seen[cmd] = name
         here = os.path.dirname(os.path.abspath(__file__))
         self.template = os.path.join(here, "..", "wrapper", "wrapper-template.sh")
 
