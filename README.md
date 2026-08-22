@@ -52,8 +52,12 @@ A candidate file is validated with `doas -C` before it atomically replaces
 the original. Rules after the managed block retain doas's last-match
 precedence and can override it. Partial, duplicated, or malformed marker
 blocks stop provisioning (the original file is never touched in that case).
-The same marked-block mechanism is used for human rc files: a managed block
-prepends the shim directory to `PATH` (`manage_human_path = true`).
+The same marked-block mechanism is used for human rc files
+(`manage_human_path = true`), with one difference: the rc block is *appended*
+and unconditionally moves the shim directory to the front of `PATH`. Rc files
+commonly add `~/.local/bin` -- where `claude`, `codex` & co. install
+themselves -- near the end (RHEL's default `.bashrc` does), and whatever runs
+last wins; a prepended block would silently lose to that.
 
 Removing an entry from `agents` revokes its managed group membership and doas
 rules and removes its managed wrapper. The Unix account and its home are
@@ -95,7 +99,7 @@ Options (also available as environment variables):
 Previously the wrapper was installed *at* the vendor binary's path, so every
 local installation update of e.g. Claude Code overwrote it. Now wrappers
 live in a dedicated root-owned **shim directory** (default
-`/usr/local/lib/agent-shims/bin`) that is prepended to each human's PATH:
+`/usr/local/lib/agent-shims/bin`) that is put first in each human's PATH:
 
 1. Only root can write there — vendor self-updaters running as the human
    physically cannot touch the wrappers.

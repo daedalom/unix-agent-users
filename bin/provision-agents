@@ -109,13 +109,17 @@ def parse_block(text):
     return lines, (begins[0], ends[0])
 
 
-def apply_block(text, body_lines):
-    """Return text with the managed block replaced/inserted at the top."""
+def apply_block(text, body_lines, where="top"):
+    """Return text with the managed block replaced in place, or inserted at
+    the top (where="top") or the end (where="end") if there is none yet."""
     new_block = [MARK_BEGIN, BLOCK_COMMENT] + body_lines + [MARK_END]
     lines, span = parse_block(text)
-    if span is None:
+    if span is not None:
+        return "\n".join(lines[: span[0]] + new_block + lines[span[1] + 1 :]) + "\n"
+    if where == "top":
         return "\n".join(new_block + [""] + lines).rstrip("\n") + "\n"
-    return "\n".join(lines[: span[0]] + new_block + lines[span[1] + 1 :]) + "\n"
+    body = "\n".join(lines).rstrip("\n")
+    return (body + "\n\n" if body else "") + "\n".join(new_block) + "\n"
 
 
 # --------------------------------------------------------------------------
@@ -416,15 +420,26 @@ def sha256_text(text):
 
 
 def manage_human_rc(cfg, human):
-    """Prepend shim dir to human PATH via managed rc block."""
+    """Put the shim dir first in the human's PATH via a managed rc block.
+
+    The block is appended, not prepended: rc files commonly add
+    ~/.local/bin (where claude, codex, ... install themselves) near the end,
+    and whatever runs last wins. For the same reason the block always moves
+    the shim dir to the front instead of skipping when it is already present.
+    """
     if not cfg.manage_human_path:
         return
     body = [
-        "# prepend root-managed agent wrapper directory to PATH",
-        'case ":$PATH:" in',
-        f'    *":{cfg.shim_dir}:"*) ;;',
-        f'    *) PATH="{cfg.shim_dir}:$PATH"; export PATH ;;',
-        "esac",
+        "# put the root-managed agent wrapper directory first in PATH",
+        "# (runs last on purpose: it must beat ~/.local/bin & co.)",
+        "_agents_path=; _agents_ifs=$IFS; IFS=:",
+        "for _agents_dir in $PATH; do",
+        f'    [ "$_agents_dir" = "{cfg.shim_dir}" ] || [ -z "$_agents_dir" ] \\',
+        '        || _agents_path="${_agents_path:+$_agents_path:}$_agents_dir"',
+        "done",
+        "IFS=$_agents_ifs",
+        f'PATH="{cfg.shim_dir}${{_agents_path:+:$_agents_path}}"; export PATH',
+        "unset _agents_path _agents_ifs _agents_dir",
     ]
     pw = pwd.getpwnam(human)
     home = pw.pw_dir
@@ -438,7 +453,7 @@ def manage_human_rc(cfg, human):
             if rc == ".profile":
                 continue  # only create .bashrc
             st, old = None, ""
-        new = apply_block(old, body)
+        new = apply_block(old, body, where="end")
         if new != old:
             info(f"updating PATH block in ~{human}/{rc}")
             tmp = path + ".agents-setup.tmp"

@@ -18,6 +18,9 @@ import tempfile
 import unittest
 from unittest import mock
 
+import subprocess
+REAL_RUN = subprocess.run   # captured before tests patch subprocess.run
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "bin", "provision-agents")
 
@@ -339,7 +342,7 @@ class ProvisionTestCase(unittest.TestCase):
         self.assertEqual(rc, [(os.path.join(alice.pw_dir, ".bashrc.agents-setup.tmp"),
                                alice.pw_uid, alice.pw_gid)])
 
-    def test_existing_profile_keeps_mode_and_block_is_prepended(self):
+    def test_existing_profile_keeps_mode_and_block_is_appended(self):
         alice = self.sys.add_user("alice")
         prof = os.path.join(alice.pw_dir, ".profile")
         with open(prof, "w") as f:
@@ -347,9 +350,25 @@ class ProvisionTestCase(unittest.TestCase):
         os.chmod(prof, 0o600)
         self.provision()
         text = self.read(prof)
-        self.assertTrue(text.startswith(self.mod.MARK_BEGIN))
-        self.assertTrue(text.endswith("export FOO=1\n"))
+        self.assertTrue(text.startswith("export FOO=1\n"))
+        self.assertTrue(text.rstrip().endswith(self.mod.MARK_END))
         self.assertEqual(stat.S_IMODE(os.stat(prof).st_mode), 0o600)
+
+    def test_rc_block_wins_over_local_bin_added_later(self):
+        """~/.local/bin is typically prepended late in .bashrc (RHEL); the
+        managed block must still come out in front, and must not be skipped
+        when the shim dir is already present somewhere in PATH."""
+        alice = self.sys.add_user("alice")
+        rc = os.path.join(alice.pw_dir, ".bashrc")
+        with open(rc, "w") as f:
+            f.write('PATH="$HOME/.local/bin:$PATH"\n')
+        self.provision()
+        shim = os.path.join(self.root, "shims")
+        env = {"HOME": alice.pw_dir, "PATH": shim + ":/usr/bin"}
+        r = REAL_RUN(["/bin/sh", "-c", f". {rc}; printf %s \"$PATH\""],
+                        env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, f"{shim}:{alice.pw_dir}/.local/bin:/usr/bin")
 
     # --- agent-home invariant ----------------------------------------------
 
@@ -365,6 +384,18 @@ class ProvisionTestCase(unittest.TestCase):
 class BlockTests(unittest.TestCase):
     def setUp(self):
         self.m = load_module()
+
+    def test_end_insert(self):
+        out = self.m.apply_block("x\n", ["a"], where="end")
+        self.assertEqual(out.splitlines(), ["x", "", self.m.MARK_BEGIN, self.m.BLOCK_COMMENT, "a", self.m.MARK_END])
+        self.assertEqual(self.m.apply_block("", ["a"], where="end").splitlines()[0], self.m.MARK_BEGIN)
+
+    def test_end_insert_is_idempotent_and_replaces_in_place(self):
+        once = self.m.apply_block("x\n", ["a"], where="end")
+        self.assertEqual(once, self.m.apply_block(once, ["a"], where="end"))
+        # block in the middle stays in the middle when updated
+        mid = "\n".join(["x", self.m.MARK_BEGIN, self.m.MARK_END, "y", ""])
+        self.assertEqual(self.m.apply_block(mid, ["b"], where="end").splitlines()[-1], "y")
 
     def test_insert_into_empty(self):
         out = self.m.apply_block("", ["a"])
