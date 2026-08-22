@@ -57,7 +57,10 @@ The same marked-block mechanism is used for human rc files
 and unconditionally moves the shim directory to the front of `PATH`. Rc files
 commonly add `~/.local/bin` -- where `claude`, `codex` & co. install
 themselves -- near the end (RHEL's default `.bashrc` does), and whatever runs
-last wins; a prepended block would silently lose to that.
+last wins; a prepended block would silently lose to that. The block also
+drops empty `PATH` entries (`::`, meaning "current directory") on purpose:
+having the cwd in `PATH` is a bad habit that would let an agent-writable
+directory shadow commands for the human.
 
 Removing an entry from `agents` revokes its managed group membership and doas
 rules and removes its managed wrapper. The Unix account and its home are

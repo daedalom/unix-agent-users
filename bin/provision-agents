@@ -426,6 +426,7 @@ def manage_human_rc(cfg, human):
     ~/.local/bin (where claude, codex, ... install themselves) near the end,
     and whatever runs last wins. For the same reason the block always moves
     the shim dir to the front instead of skipping when it is already present.
+    Empty PATH entries (cwd) are dropped deliberately; see README.
     """
     if not cfg.manage_human_path:
         return
