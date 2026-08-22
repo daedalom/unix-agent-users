@@ -284,6 +284,14 @@ def reconcile_group(cfg):
         if u not in allowed:
             warn(f"revoking stale {cfg.shared_group} membership of {u!r}")
             set_membership(u, cfg.shared_group, member=False)
+    # Primary-group membership is not listed in gr_mem and cannot be revoked
+    # with gpasswd; it would silently bypass the "fully owned" promise.
+    gid = grp.getgrnam(cfg.shared_group).gr_gid
+    for pw in pwd.getpwall():
+        if pw.pw_gid == gid and pw.pw_name not in allowed:
+            die(f"{cfg.shared_group} is the primary group of unlisted user "
+                f"{pw.pw_name!r}; provisioning cannot revoke primary membership -- "
+                f"change that user's primary group or pick another shared_group")
     for u in sorted(allowed):
         set_membership(u, cfg.shared_group, member=True)
 
