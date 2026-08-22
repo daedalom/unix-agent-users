@@ -673,4 +673,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as e:          # failed subprocess, malformed block
+        die(str(e))
+    except FileNotFoundError as e:     # missing tool (doas, runuser, ...)
+        die(f"{e.filename}: not found (run bin/check-deps)")
+    except (OSError, KeyError) as e:   # permissions, unknown user/group
+        die(f"{type(e).__name__}: {e}")
+    except KeyboardInterrupt:
+        die("interrupted; re-run 'provision --all' to converge")
