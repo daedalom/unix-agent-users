@@ -116,16 +116,23 @@ def parse_block(text, marks=SH_MARKS):
     return lines, (begins[0], ends[0])
 
 
-def apply_block(text, body_lines, where="top", marks=SH_MARKS):
-    """Return text with the managed block replaced in place, or inserted at
-    the top (where="top") or the end (where="end") if there is none yet."""
+def apply_block(text, body_lines, where="last", marks=SH_MARKS):
+    """Return text with the managed block converged.
+
+    where="last":   the block is always the last thing in the file; an
+                    existing block elsewhere is moved there. For files with
+                    last-match semantics (doas.conf, shell rc files).
+    where="append": an existing block is updated in place; a missing one is
+                    appended. For files where position does not matter.
+    """
     begin, end, comment = marks
     new_block = [begin, comment] + body_lines + [end]
     lines, span = parse_block(text, marks)
     if span is not None:
-        return "\n".join(lines[: span[0]] + new_block + lines[span[1] + 1 :]) + "\n"
-    if where == "top":
-        return "\n".join(new_block + [""] + lines).rstrip("\n") + "\n"
+        if where == "append" or span[1] == len(lines) - 1:
+            return "\n".join(lines[: span[0]] + new_block + lines[span[1] + 1 :]) + "\n"
+        text = strip_block(text, marks)
+        lines = text.splitlines()
     body = "\n".join(lines).rstrip("\n")
     return (body + "\n\n" if body else "") + "\n".join(new_block) + "\n"
 
@@ -426,7 +433,7 @@ def install_agent_doc(cfg, agent, command):
     body = render_doc(cfg, agent, command)
     old = read_agent_file(agent, path)
     try:
-        new = apply_block(old, body, where="end", marks=MD_MARKS)
+        new = apply_block(old, body, where="append", marks=MD_MARKS)
     except RuntimeError as e:
         warn(f"{path}: {e}; leaving it alone")
         return path, None
@@ -569,7 +576,7 @@ def manage_human_rc(cfg, human):
             if rc == ".profile":
                 continue  # only create .bashrc
             st, old = None, ""
-        new = apply_block(old, body, where="end")
+        new = apply_block(old, body, where="last")
         if new != old:
             info(f"updating PATH block in ~{human}/{rc}")
             tmp = path + ".agents-setup.tmp"
@@ -607,8 +614,10 @@ def rewrite_doas_conf(rules):
         mode = stat.S_IMODE(st.st_mode)
     except FileNotFoundError:
         old, mode = "", 0o600
+    # doas uses last-match: the managed block must come after everything
+    # else, or e.g. a stock 'permit :wheel' would override 'nopass'.
     try:
-        new = apply_block(old, rules)
+        new = apply_block(old, rules, where="last")
     except RuntimeError as e:
         die(str(e))
     if new == old:

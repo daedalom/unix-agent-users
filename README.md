@@ -48,17 +48,22 @@ accounts not listed in `humans` or `agents` are removed from it. The group
 should therefore not be used to grant unrelated access.
 
 Because doas has no include-directory mechanism, provisioning maintains a
-marked block at the start of `/etc/doas.conf` and preserves all other rules.
+marked block at the **end** of `/etc/doas.conf` and preserves all other rules.
 A candidate file is validated with `doas -C` before it atomically replaces
-the original. Rules after the managed block retain doas's last-match
-precedence and can override it. Partial, duplicated, or malformed marker
-blocks stop provisioning (the original file is never touched in that case).
-The same marked-block mechanism is used for human rc files
-(`manage_human_path = true`), with one difference: the rc block is *appended*
-and unconditionally moves the shim directory to the front of `PATH`. Rc files
-commonly add `~/.local/bin` -- where `claude`, `codex` & co. install
-themselves -- near the end (RHEL's default `.bashrc` does), and whatever runs
-last wins; a prepended block would silently lose to that. The block also
+the original. doas uses last-match semantics, so the block must come last: a
+stock `permit persist :wheel` placed after it would silently re-enable the
+password prompt for wrapper invocations. If an earlier version put the block
+at the top, the next run moves it to the end. Rules you want to take
+precedence over the managed ones therefore have to go *inside* the block --
+which means editing `setup.conf` instead. Partial, duplicated, or malformed
+marker blocks stop provisioning (the original file is never touched in that
+case).
+
+The same marked-block mechanism, with the same always-last placement, is used
+for human rc files (`manage_human_path = true`); the rc block unconditionally
+moves the shim directory to the front of `PATH`. Rc files commonly add
+`~/.local/bin` -- where `claude`, `codex` & co. install themselves -- near the
+end (RHEL's default `.bashrc` does), and whatever runs last wins. The block also
 drops empty `PATH` entries (`::`, meaning "current directory") on purpose:
 having the cwd in `PATH` is a bad habit that would let an agent-writable
 directory shadow commands for the human.

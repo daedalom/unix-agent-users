@@ -264,15 +264,36 @@ class ProvisionTestCase(unittest.TestCase):
         mutating = {"useradd", "groupadd", "usermod", "gpasswd", "ssh-keygen"}
         self.assertFalse([c for _, c in self.sys.commands if c[0] in mutating])
 
-    def test_doas_block_preserves_foreign_rules(self):
+    def test_doas_block_comes_last_so_nopass_wins(self):
+        """doas is last-match: a stock 'permit :wheel' after our block would
+        re-enable the password prompt for wrapper invocations."""
         self.sys.add_user("alice")
         with open(self.doas_conf, "w") as f:
             f.write("permit persist :wheel\n")
         self.provision()
         text = self.read(self.doas_conf)
-        self.assertTrue(text.startswith(self.mod.MARK_BEGIN))
+        self.assertTrue(text.startswith("permit persist :wheel\n\n" + self.mod.MARK_BEGIN))
         self.assertIn("permit nopass alice as claude", text)
-        self.assertTrue(text.rstrip().endswith("permit persist :wheel"))
+        self.assertTrue(text.rstrip().endswith(self.mod.MARK_END))
+
+    def test_legacy_top_block_is_moved_to_the_end(self):
+        self.sys.add_user("alice")
+        m = self.mod
+        with open(self.doas_conf, "w") as f:
+            f.write("\n".join([m.MARK_BEGIN, m.BLOCK_COMMENT, "permit nopass alice as claude",
+                                m.MARK_END, "", "permit persist :wheel", ""]))
+        self.provision()
+        text = self.read(self.doas_conf)
+        self.assertEqual(text.count(m.MARK_BEGIN), 1)
+        self.assertTrue(text.startswith("permit persist :wheel\n\n" + m.MARK_BEGIN))
+        self.assertTrue(text.rstrip().endswith(m.MARK_END))
+        # and the rc block behaves the same
+        alice = self.sys.users["alice"]
+        rc = os.path.join(alice.pw_dir, ".bashrc")
+        with open(rc, "w") as f:
+            f.write("\n".join([m.MARK_BEGIN, m.MARK_END, "", 'PATH="$HOME/.local/bin:$PATH"', ""]))
+        self.provision()
+        self.assertTrue(self.read(rc).rstrip().endswith(m.MARK_END))
 
     def test_malformed_doas_block_aborts(self):
         self.sys.add_user("alice")
@@ -481,17 +502,23 @@ class BlockTests(unittest.TestCase):
     def setUp(self):
         self.m = load_module()
 
-    def test_end_insert(self):
-        out = self.m.apply_block("x\n", ["a"], where="end")
+    def test_last_insert(self):
+        out = self.m.apply_block("x\n", ["a"], where="last")
         self.assertEqual(out.splitlines(), ["x", "", self.m.MARK_BEGIN, self.m.BLOCK_COMMENT, "a", self.m.MARK_END])
-        self.assertEqual(self.m.apply_block("", ["a"], where="end").splitlines()[0], self.m.MARK_BEGIN)
+        self.assertEqual(self.m.apply_block("", ["a"], where="last").splitlines()[0], self.m.MARK_BEGIN)
 
-    def test_end_insert_is_idempotent_and_replaces_in_place(self):
-        once = self.m.apply_block("x\n", ["a"], where="end")
-        self.assertEqual(once, self.m.apply_block(once, ["a"], where="end"))
-        # block in the middle stays in the middle when updated
+    def test_last_moves_block_to_end_and_is_idempotent(self):
+        once = self.m.apply_block("x\n", ["a"], where="last")
+        self.assertEqual(once, self.m.apply_block(once, ["a"], where="last"))
         mid = "\n".join(["x", self.m.MARK_BEGIN, self.m.MARK_END, "y", ""])
-        self.assertEqual(self.m.apply_block(mid, ["b"], where="end").splitlines()[-1], "y")
+        out = self.m.apply_block(mid, ["b"], where="last")
+        self.assertEqual(out.splitlines(), ["x", "y", "", self.m.MARK_BEGIN, self.m.BLOCK_COMMENT, "b", self.m.MARK_END])
+
+    def test_append_keeps_block_in_place(self):
+        mid = "\n".join(["x", self.m.MARK_BEGIN, self.m.MARK_END, "y", ""])
+        out = self.m.apply_block(mid, ["b"], where="append")
+        self.assertEqual(out.splitlines(), ["x", self.m.MARK_BEGIN, self.m.BLOCK_COMMENT, "b", self.m.MARK_END, "y"])
+        self.assertEqual(self.m.apply_block("x\n", ["b"], where="append").splitlines()[0], "x")
 
     def test_strip_block(self):
         M = self.m.MD_MARKS
@@ -510,7 +537,7 @@ class BlockTests(unittest.TestCase):
         old = "\n".join(["x", self.m.MARK_BEGIN, "junk", self.m.MARK_END, "y", ""])
         out = self.m.apply_block(old, ["b"])
         self.assertEqual(out.splitlines(),
-                         ["x", self.m.MARK_BEGIN, self.m.BLOCK_COMMENT, "b", self.m.MARK_END, "y"])
+                         ["x", "y", "", self.m.MARK_BEGIN, self.m.BLOCK_COMMENT, "b", self.m.MARK_END])
 
     def test_idempotent(self):
         once = self.m.apply_block("tail\n", ["r1", "r2"])
