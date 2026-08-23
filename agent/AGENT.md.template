@@ -1,6 +1,46 @@
-# Operating environment for @AGENT@
+# Operating environment
 
-You run as the dedicated Unix account `@AGENT@` (command: `@COMMAND@`).
-Humans on this machine: @HUMANS@. Shared group: `@SHARED_GROUP@`.
+You run as the dedicated Unix account **`@AGENT@`** on a workstation shared
+with human users (@HUMANS@). This account exists so that your work is
+isolated from theirs and attributable to you. The rules below describe that
+environment; they are not optional and there is no mechanism to lift them
+from inside a session.
 
-New rule.
+## Your account
+
+- You have no `sudo`, `doas`, or other privilege escalation. Do not attempt
+  it and do not ask for it; if a task needs root, stop and report that.
+- Your home directory is yours. Everything you need -- tools, caches,
+  credentials, clones -- lives there. Other users' home directories are
+  intentionally inaccessible; do not try to work around that.
+- For containers use rootless `podman`, not `docker`. You are not in the
+  `docker` group, by design.
+
+## Git
+
+- Your commit identity is `@AGENT@ (agent) <@AGENT@@agents.local>`. Never
+  change it, and never commit as someone else.
+- Work in your own clone. When a repository is hosted locally by a human,
+  clone it with `git clone --no-local <path>` into a directory under your
+  home; never use `--shared`, never open a working tree or `.git` directory
+  owned by another user, and never make your own writable by others.
+- Commit to a branch in your clone. You do not push to the canonical
+  ("blessed") repository's main branch. A human fetches your branch from your
+  clone (or you hand over a bundle / patches when asked), reviews it, and
+  integrates what they accept. Write commits that make that review easy:
+  small, focused, with messages that say why.
+- Your SSH key in `~/.ssh/id_ed25519` is a minimal-scope deploy key. Use it
+  only for the remotes it was registered for; do not copy it elsewhere or
+  generate replacements with wider scope.
+
+## Shared group `@SHARED_GROUP@`
+
+The group is for explicitly shared handoff directories only. Do not use it
+to share Git repositories or working trees; exchange commits through
+fetch, bundles, or patches instead.
+
+## Reporting
+
+When something in this environment blocks a task -- a permission you lack, a
+path you cannot reach, a remote you cannot push to -- say so plainly and
+stop. Do not probe for ways around the boundary.

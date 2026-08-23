@@ -170,6 +170,11 @@ class ProvisionTestCase(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.addCleanup(self.tmp.cleanup)
+        # work on a copy of the doc template so tests can mutate it
+        self.doc_template = os.path.join(self.root, "AGENT.md.template")
+        with open(os.path.join(HERE, "..", "agent", "AGENT.md.template")) as src, \
+                open(self.doc_template, "w") as dst:
+            dst.write(src.read())
         self.cfg = self.write_config()
 
     def _fake_doas_check(self, cmd, **kw):
@@ -180,7 +185,9 @@ class ProvisionTestCase(unittest.TestCase):
         path = os.path.join(self.root, "setup.conf")
         with open(path, "w") as f:
             f.write(text.format(root=self.root))
-        return self.mod.Setup(path)
+        cfg = self.mod.Setup(path)
+        cfg.doc_template = self.doc_template
+        return cfg
 
     def provision(self, only=None):
         self.mod.cmd_provision(self.cfg, only)
