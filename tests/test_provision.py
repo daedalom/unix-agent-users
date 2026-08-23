@@ -80,7 +80,7 @@ class FakeSystem:
         return list(self.users.values())
 
     # --- fake run() -----------------------------------------------------
-    def run(self, cmd, as_user=None, check=True):
+    def run(self, cmd, as_user=None, check=True, input=None):
         self.commands.append((as_user, list(cmd)))
         R = collections.namedtuple("R", "returncode stdout stderr")
         c = cmd[0]
@@ -110,8 +110,15 @@ class FakeSystem:
             with open(keyfile + ".pub", "w") as f:
                 f.write(f"ssh-ed25519 FAKE {as_user}-agent\n")
         elif c == "cat":
+            if not os.path.exists(cmd[-1]):
+                return R(1, "", "cat: no such file")
             with open(cmd[-1]) as f:
                 return R(0, f.read(), "")
+        elif c == "sh" and cmd[1] == "-c" and "mkdir -p" in cmd[2]:
+            # write_agent_file: sh -c SCRIPT name DIR PATH, content on stdin
+            os.makedirs(cmd[4], exist_ok=True)
+            with open(cmd[5], "w") as f:
+                f.write(input)
         else:
             raise AssertionError(f"unexpected command {cmd}")
         return R(0, "", "")
@@ -370,6 +377,88 @@ class ProvisionTestCase(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, f"{shim}:{alice.pw_dir}/.local/bin:/usr/bin")
 
+    # --- agent instruction file --------------------------------------------
+
+    def doc(self, agent, rel):
+        return os.path.join(self.sys.users[agent].pw_dir, rel)
+
+    def test_doc_installed_at_tool_default_locations(self):
+        self.sys.add_user("alice")
+        self.provision()
+        claude = self.read(self.doc("claude", ".claude/CLAUDE.md"))
+        codex = self.read(self.doc("codex", ".codex/AGENTS.md"))
+        self.assertIn(self.mod.MD_MARKS[0], claude)
+        self.assertIn("`claude`", claude)
+        self.assertIn("`codex`", codex)
+        self.assertIn("alice", claude)
+        self.assertNotIn("@AGENT@", claude)
+        self.assertEqual(self.read(self.root, "state", "agents", "claude.json").count('"doc_path"'), 1)
+
+    def test_doc_is_only_touched_as_agent_and_idempotent(self):
+        self.sys.add_user("alice")
+        self.provision()
+        for as_user, cmd in self.sys.commands:
+            if any(".claude" in a for a in cmd):
+                self.assertEqual(as_user, "claude", cmd)
+        before = self.read(self.doc("claude", ".claude/CLAUDE.md"))
+        self.sys.commands.clear()
+        self.provision()
+        self.assertEqual(before, self.read(self.doc("claude", ".claude/CLAUDE.md")))
+        self.assertFalse([c for _, c in self.sys.commands if c[0] == "sh"])  # no rewrite
+
+    def test_doc_block_appended_to_existing_file_and_user_text_kept(self):
+        self.sys.add_user("alice")
+        self.sys.add_user("claude")
+        p = self.doc("claude", ".claude/CLAUDE.md")
+        os.makedirs(os.path.dirname(p))
+        with open(p, "w") as f:
+            f.write("# My notes\n\nRemember X.\n")
+        self.provision()
+        text = self.read(p)
+        self.assertTrue(text.startswith("# My notes\n\nRemember X.\n\n" + self.mod.MD_MARKS[0]))
+        # template change -> block updated in place, notes untouched
+        with open(self.cfg.doc_template, "a") as f:
+            f.write("\nNew rule.\n")
+        self.provision()
+        text = self.read(p)
+        self.assertIn("New rule.", text)
+        self.assertEqual(text.count(self.mod.MD_MARKS[0]), 1)
+        self.assertTrue(text.startswith("# My notes"))
+
+    def test_doc_override_and_none(self):
+        self.sys.add_user("alice")
+        self.cfg = self.write_config(CONFIG + "[agent.claude]\ndoc = none\n[agent.codex]\ndoc = notes/RULES.md\n")
+        self.provision()
+        self.assertFalse(os.path.exists(self.doc("claude", ".claude/CLAUDE.md")))
+        self.assertTrue(os.path.exists(self.doc("codex", "notes/RULES.md")))
+
+    def test_doc_bad_paths_rejected(self):
+        for bad in ("/etc/x.md", "../x.md", "a'b.md"):
+            with self.assertRaises(SystemExit, msg=bad):
+                self.write_config(CONFIG + f"[agent.claude]\ndoc = {bad}\n")
+        with self.assertRaises(SystemExit):
+            self.write_config(CONFIG + "[agent.nobody]\ndoc = x.md\n")
+
+    def test_doc_block_removed_when_agent_pruned(self):
+        self.sys.add_user("alice")
+        self.sys.add_user("codex")
+        p = self.doc("codex", ".codex/AGENTS.md")
+        os.makedirs(os.path.dirname(p))
+        with open(p, "w") as f:
+            f.write("keep me\n")
+        self.provision()
+        self.cfg = self.write_config(CONFIG.replace("codex = codex\n", ""))
+        self.provision()
+        self.assertEqual(self.read(p), "keep me\n")
+
+    def test_doc_block_removed_leaves_empty_file(self):
+        self.sys.add_user("alice")
+        self.provision()
+        p = self.doc("codex", ".codex/AGENTS.md")
+        self.cfg = self.write_config(CONFIG.replace("codex = codex\n", ""))
+        self.provision()
+        self.assertEqual(self.read(p), "")
+
     # --- agent-home invariant ----------------------------------------------
 
     def test_agent_home_is_only_touched_as_agent(self):
@@ -396,6 +485,15 @@ class BlockTests(unittest.TestCase):
         # block in the middle stays in the middle when updated
         mid = "\n".join(["x", self.m.MARK_BEGIN, self.m.MARK_END, "y", ""])
         self.assertEqual(self.m.apply_block(mid, ["b"], where="end").splitlines()[-1], "y")
+
+    def test_strip_block(self):
+        M = self.m.MD_MARKS
+        text = "\n".join(["a", "", M[0], M[2], "x", M[1], ""])
+        self.assertEqual(self.m.strip_block(text, M), "a\n")
+        text = "\n".join([M[0], M[1], "", "b", ""])
+        self.assertEqual(self.m.strip_block(text, M), "b\n")
+        self.assertEqual(self.m.strip_block("plain\n", M), "plain\n")
+        self.assertEqual(self.m.strip_block("\n".join([M[0], M[1], ""]), M), "")
 
     def test_insert_into_empty(self):
         out = self.m.apply_block("", ["a"])

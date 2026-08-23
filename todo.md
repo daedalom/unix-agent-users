@@ -1,7 +1,8 @@
 # All items below are solved in the Python re-implementation (2026-08).
 
-[x] drop AGENT.md / CLAUDE.md generation (workflow docs live in README.md only)
-    -> provisioner generates no markdown files at all.
+[x] drop a copy of AGENT.md into the agent's home (~/.codex/, ~/.claude/)
+    -> managed block rendered from agent/AGENT.md.template into the tool's
+       user-level instruction file; written as the agent; per-agent override.
 
 [x] wrapper: option to invoke shadowed binary directly
     -> `claude --direct` (or AGENT_WRAPPER_DIRECT=1) execs the real binary

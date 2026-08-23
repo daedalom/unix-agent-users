@@ -13,6 +13,7 @@ semantics, plus the previously open TODO items solved (see below).
     bin/provision-agents           provision / remove / status (Python)
     bin/check-deps                 dependency checker, optional --install
     wrapper/wrapper-template.sh    doas wrapper template (rendered per agent)
+    agent/AGENT.md.template        operating instructions installed into each agent's home
     tests/test_provision.py        root-free unit tests (python3 -m unittest discover -s tests)
 
 Provisioning is idempotent: re-running converges the system toward
@@ -129,8 +130,21 @@ each agent account keep its own installation.
 Terminals launched by IDEs or desktop sessions that skip those files will not
 see the shim dir; add it to their PATH yourself in that case.
 
-No `AGENT.md`/`CLAUDE.md` files are generated; workflow documentation lives
-here in the README only.
+## Agent instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`)
+
+The agent has no other way to learn the rules it operates under, so
+provisioning installs a managed block rendered from `agent/AGENT.md.template`
+into the tool's user-level instruction file in the agent's home (the file the
+tool reads for every project): `~/.claude/CLAUDE.md` for `claude`,
+`~/.codex/AGENTS.md` for `codex`, `~/AGENTS.md` otherwise. Override or disable
+per agent in `setup.conf` (`[agent.NAME] doc = path` / `doc = none`).
+
+Only the marked block is managed; anything else in the file is preserved, so
+the agent can keep its own notes there. The block is read and written *as the
+agent* (see the invariant in `bin/provision-agents`). It is guidance, not
+enforcement: the account boundary is what actually holds. `status` reports
+`doc=ok|MODIFIED|MISSING`, and `provision` re-converges it; removing an agent
+strips the block and leaves the rest of the file.
 
 ## Repository workflow
 

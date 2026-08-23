@@ -41,6 +41,11 @@ import tempfile
 MARK_BEGIN = "#>>> agents-setup begin >>>"
 MARK_END = "#<<< agents-setup end <<<"
 BLOCK_COMMENT = "# managed by agents-setup; edit config/setup.conf, then rerun provision-agents"
+SH_MARKS = (MARK_BEGIN, MARK_END, BLOCK_COMMENT)
+# Markdown flavour (agent instruction files): HTML comments stay invisible.
+MD_MARKS = ("<!-- >>> agents-setup begin >>> -->",
+            "<!-- <<< agents-setup end <<< -->",
+            "<!-- managed by agents-setup; edit agent/AGENT.md.template, then rerun provision-agents -->")
 
 VALID_NAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 DOAS_CONF = "/etc/doas.conf"
@@ -59,8 +64,9 @@ def info(msg):
     print(f"==> {msg}")
 
 
-def run(cmd, as_user=None, check=True):
+def run(cmd, as_user=None, check=True, input=None):
     """Run a command, optionally via runuser. Returns CompletedProcess.
+    INPUT, if given, is fed to the command's stdin.
 
     Commands run as another user start from "/" rather than inheriting the
     caller's cwd: root typically provisions from /root (mode 0700), and
@@ -70,7 +76,7 @@ def run(cmd, as_user=None, check=True):
     if as_user:
         cmd = ["runuser", "-u", as_user, "--"] + cmd
         cwd = "/"
-    r = subprocess.run(cmd, text=True, capture_output=True, cwd=cwd)
+    r = subprocess.run(cmd, text=True, capture_output=True, cwd=cwd, input=input)
     if check and r.returncode != 0:
         raise RuntimeError(
             "command failed ({}): {}\n{}".format(
@@ -91,14 +97,15 @@ def ensure_dir(path, mode):
 # marked-block parsing (shared by /etc/doas.conf and human rc files)
 # --------------------------------------------------------------------------
 
-def parse_block(text):
+def parse_block(text, marks=SH_MARKS):
     """Locate the single managed block. Returns (lines, span_or_None).
 
     Raises on partial/duplicated/malformed marker blocks.
     """
+    begin, end, _ = marks
     lines = text.splitlines()
-    begins = [i for i, l in enumerate(lines) if l.strip() == MARK_BEGIN]
-    ends = [i for i, l in enumerate(lines) if l.strip() == MARK_END]
+    begins = [i for i, l in enumerate(lines) if l.strip() == begin]
+    ends = [i for i, l in enumerate(lines) if l.strip() == end]
     if not begins and not ends:
         return lines, None
     if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
@@ -109,11 +116,12 @@ def parse_block(text):
     return lines, (begins[0], ends[0])
 
 
-def apply_block(text, body_lines, where="top"):
+def apply_block(text, body_lines, where="top", marks=SH_MARKS):
     """Return text with the managed block replaced in place, or inserted at
     the top (where="top") or the end (where="end") if there is none yet."""
-    new_block = [MARK_BEGIN, BLOCK_COMMENT] + body_lines + [MARK_END]
-    lines, span = parse_block(text)
+    begin, end, comment = marks
+    new_block = [begin, comment] + body_lines + [end]
+    lines, span = parse_block(text, marks)
     if span is not None:
         return "\n".join(lines[: span[0]] + new_block + lines[span[1] + 1 :]) + "\n"
     if where == "top":
@@ -122,9 +130,32 @@ def apply_block(text, body_lines, where="top"):
     return (body + "\n\n" if body else "") + "\n".join(new_block) + "\n"
 
 
+def strip_block(text, marks=SH_MARKS):
+    """Return text without the managed block (and one adjacent blank line)."""
+    lines, span = parse_block(text, marks)
+    if span is None:
+        return text
+    head, tail = lines[: span[0]], lines[span[1] + 1 :]
+    if head and head[-1] == "":
+        head = head[:-1]
+    elif tail and tail[0] == "":
+        tail = tail[1:]
+    out = "\n".join(head + tail)
+    return out + "\n" if out else ""
+
+
 # --------------------------------------------------------------------------
 # config
 # --------------------------------------------------------------------------
+
+def default_doc_path(command):
+    """Where the tool behind COMMAND reads user-level instructions from,
+    relative to the agent's home."""
+    return {
+        "claude": ".claude/CLAUDE.md",
+        "codex": ".codex/AGENTS.md",
+    }.get(command, "AGENTS.md")
+
 
 class Setup:
     def __init__(self, path):
@@ -147,6 +178,15 @@ class Setup:
             for name, cmd in cp["agents"].items():
                 cmd = cmd.strip() or name
                 self.agents[name] = cmd
+            # Optional per-agent overrides: [agent.NAME] doc = PATH | none
+            self.agent_docs = {}
+            for name, cmd in self.agents.items():
+                sect = f"agent.{name}"
+                doc = cp[sect].get("doc", "").strip() if cp.has_section(sect) else ""
+                self.agent_docs[name] = doc or default_doc_path(cmd)
+            for sect in cp.sections():
+                if sect.startswith("agent.") and sect[6:] not in self.agents:
+                    die(f"section [{sect}] refers to an agent not listed under [agents]")
         except (KeyError, ValueError) as e:
             die(f"bad config {path}: {e}")
         for n in list(self.humans) + list(self.agents):
@@ -168,8 +208,14 @@ class Setup:
                 die(f"{key} must be an absolute path: {val!r}")
             if "'" in val or any(c.isspace() for c in val):
                 die(f"{key} must not contain quotes or whitespace: {val!r}")
+        for name, doc in self.agent_docs.items():
+            if doc != "none" and (doc.startswith("/") or ".." in doc.split("/")
+                                  or any(c in doc for c in "'\"\n")):
+                die(f"agent {name!r}: doc must be 'none' or a path relative to the "
+                    f"agent's home without '..' or quotes: {doc!r}")
         here = os.path.dirname(os.path.abspath(__file__))
         self.template = os.path.join(here, "..", "wrapper", "wrapper-template.sh")
+        self.doc_template = os.path.join(here, "..", "agent", "AGENT.md.template")
 
     def existing_humans(self):
         ok = []
@@ -331,6 +377,75 @@ def ensure_agent_ssh_key(name):
             as_user=name,
         )
     return run(["cat", key + ".pub"], as_user=name).stdout.strip()
+
+
+# --------------------------------------------------------------------------
+# agent instruction file (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ...)
+# --------------------------------------------------------------------------
+
+def render_doc(cfg, agent, command):
+    """Render the doc template to block lines (no markers)."""
+    with open(cfg.doc_template) as f:
+        tpl = f.read()
+    for k, v in [
+        ("@AGENT@", agent),
+        ("@COMMAND@", command),
+        ("@HUMANS@", ", ".join(cfg.humans) or "(none configured)"),
+        ("@SHARED_GROUP@", cfg.shared_group),
+    ]:
+        tpl = tpl.replace(k, v)
+    if re.search(r"@[A-Z_]+@", tpl):
+        die("agent doc template contains unresolved placeholders")
+    return tpl.rstrip("\n").splitlines()
+
+
+def read_agent_file(agent, path):
+    """Read a file under the agent's home as the agent; '' if missing."""
+    r = run(["cat", path], as_user=agent, check=False)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def write_agent_file(agent, path, content):
+    """Atomically write a file under the agent's home, as the agent."""
+    run(["sh", "-c", 'mkdir -p "$1" && cat > "$2.tmp" && mv -f "$2.tmp" "$2"',
+         "agents-setup", os.path.dirname(path), path],
+        as_user=agent, input=content)
+
+
+def install_agent_doc(cfg, agent, command):
+    """Converge the managed block in the agent's instruction file.
+
+    Everything here runs as the agent (see INVARIANT). The file is guidance,
+    not enforcement: the agent may edit it, and 'status' reports drift.
+    Returns (path, sha256 of the block body) or (None, None) if disabled.
+    """
+    rel = cfg.agent_docs.get(agent, "none")
+    if rel == "none":
+        return None, None
+    path = os.path.join(pwd.getpwnam(agent).pw_dir, rel)
+    body = render_doc(cfg, agent, command)
+    old = read_agent_file(agent, path)
+    try:
+        new = apply_block(old, body, where="end", marks=MD_MARKS)
+    except RuntimeError as e:
+        warn(f"{path}: {e}; leaving it alone")
+        return path, None
+    if new != old:
+        info(f"updating agent instructions in {path}")
+        write_agent_file(agent, path, new)
+    return path, sha256_text("\n".join(body))
+
+
+def remove_agent_doc(agent, path):
+    old = read_agent_file(agent, path)
+    try:
+        new = strip_block(old, MD_MARKS)
+    except RuntimeError:
+        warn(f"{path}: malformed managed block; leaving it alone")
+        return
+    if new != old:
+        info(f"removing managed block from {path}")
+        write_agent_file(agent, path, new)
 
 
 def check_human_homes(agent, humans):
@@ -530,6 +645,7 @@ def provision_agent(cfg, state, name, command, humans, summary):
              f"install it later -- the wrapper resolves it at runtime")
     content = render_wrapper(cfg, name, command, target)
     install_wrapper(cfg, command, content)
+    doc_path, doc_sha = install_agent_doc(cfg, name, command)
 
     old = state.load_agents().get(name, {})
     if old.get("wrapper_sha256") != sha256_text(content):
@@ -542,6 +658,8 @@ def provision_agent(cfg, state, name, command, humans, summary):
         "pubkey": pubkey,
         "wrapper_path": wrapper_path,
         "wrapper_sha256": sha256_text(content),
+        "doc_path": doc_path,
+        "doc_sha256": doc_sha,
     })
     summary.append((name, target, pubkey))
 
@@ -614,6 +732,8 @@ def remove_agent(cfg, state, name):
             warn(f"wrapper {rec['wrapper_path']} was modified; leaving it alone")
     if Setup._user_exists(name):
         set_membership(name, cfg.shared_group, member=False)
+        if rec and rec.get("doc_path"):
+            remove_agent_doc(name, rec["doc_path"])
     state.drop_agent(name)
 
 
@@ -677,7 +797,23 @@ def cmd_status(cfg):
         drift = ""
         if target_now != rec.get("target"):
             drift += f"  [target moved: now {target_now or 'unresolved'}]"
-        print(f"agent {name}: command={command} wrapper={ok_wrap}{drift}")
+        doc = ""
+        if rec.get("doc_path"):
+            if os.geteuid() != 0:
+                doc = " doc=(run as root to check)"
+            else:
+                text = read_agent_file(name, rec["doc_path"]) if Setup._user_exists(name) else ""
+                try:
+                    _, span = parse_block(text, MD_MARKS)
+                except RuntimeError:
+                    span = None
+                if span is None:
+                    doc = " doc=MISSING"
+                else:
+                    lines = text.splitlines()[span[0] + 2 : span[1]]
+                    doc = " doc=ok" if sha256_text("\n".join(lines)) == rec.get("doc_sha256") \
+                        else " doc=MODIFIED"
+        print(f"agent {name}: command={command} wrapper={ok_wrap}{doc}{drift}")
     rules_expected = len(build_doas_rules(cfg, humans))
     print(f"expected doas rules: {rules_expected} ({len(humans)} humans x {len(cfg.agents)} agents)")
 

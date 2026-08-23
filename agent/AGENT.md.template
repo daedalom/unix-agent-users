@@ -1,0 +1,6 @@
+# Operating environment for @AGENT@
+
+You run as the dedicated Unix account `@AGENT@` (command: `@COMMAND@`).
+Humans on this machine: @HUMANS@. Shared group: `@SHARED_GROUP@`.
+
+New rule.
