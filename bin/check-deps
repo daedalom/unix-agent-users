@@ -21,7 +21,10 @@ import sys
 
 # binary -> package per distro family
 PKGS = {
-    "doas":       {"debian": "doas", "rhel": "opendoas",
+    # "opendoas" everywhere: Debian renamed its "doas" binary package to
+    # "opendoas" in bookworm (Ubuntu: noble), keeping "doas" only as a
+    # transitional package that is not reliably installable by that name.
+    "doas":       {"debian": "opendoas", "rhel": "opendoas",
                    "suse": "opendoas", "arch": "opendoas"},
     "git":        {"debian": "git", "rhel": "git", "suse": "git", "arch": "git"},
     "ssh-keygen": {"debian": "openssh-client", "rhel": "openssh-clients",
