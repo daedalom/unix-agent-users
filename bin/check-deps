@@ -4,6 +4,10 @@
 Checks required tools (doas, git, ssh, shadow-utils) and recommended ones
 (tmux for wrapper --tmux sessions, podman for container workloads).
 
+Package names and the package manager are chosen by first detecting the
+distro family (os-release, with older release files as fallback), not by
+guessing from whatever manager happens to be on PATH.
+
 Usage:
     check-deps                 report status; exit 1 if a REQUIRED tool is missing
     check-deps --install       install everything that is missing
@@ -15,43 +19,117 @@ import shutil
 import subprocess
 import sys
 
-# binary -> packages per package manager
+# binary -> package per distro family
 PKGS = {
-    "doas":       {"dnf": "opendoas", "apt": "doas", "zypper": "opendoas", "pacman": "opendoas"},
-    "git":        {"dnf": "git", "apt": "git", "zypper": "git", "pacman": "git"},
-    "ssh-keygen": {"dnf": "openssh-clients", "apt": "openssh-client",
-                   "zypper": "openssh", "pacman": "openssh"},
-    "usermod":    {"dnf": "shadow-utils", "apt": "passwd",
-                   "zypper": "shadow", "pacman": "shadow"},
+    # "opendoas" everywhere: Debian renamed its "doas" binary package to
+    # "opendoas" in bookworm (Ubuntu: noble), keeping "doas" only as a
+    # transitional package that is not reliably installable by that name.
+    "doas":       {"debian": "opendoas", "rhel": "opendoas",
+                   "suse": "opendoas", "arch": "opendoas"},
+    "git":        {"debian": "git", "rhel": "git", "suse": "git", "arch": "git"},
+    "ssh-keygen": {"debian": "openssh-client", "rhel": "openssh-clients",
+                   "suse": "openssh", "arch": "openssh"},
+    "usermod":    {"debian": "passwd", "rhel": "shadow-utils",
+                   "suse": "shadow", "arch": "shadow"},
     "gpasswd":    None,  # same package as usermod
-    "runuser":    {"dnf": "util-linux", "apt": "util-linux",
-                   "zypper": "util-linux", "pacman": "util-linux"},
+    "runuser":    {"debian": "util-linux", "rhel": "util-linux",
+                   "suse": "util-linux", "arch": "util-linux"},
     # recommended / feature-gated
-    "tmux":       {"dnf": "tmux", "apt": "tmux", "zypper": "tmux", "pacman": "tmux"},
-    "podman":     {"dnf": "podman", "apt": "podman", "zypper": "podman", "pacman": "podman"},
+    "tmux":       {"debian": "tmux", "rhel": "tmux", "suse": "tmux", "arch": "tmux"},
+    "podman":     {"debian": "podman", "rhel": "podman",
+                   "suse": "podman", "arch": "podman"},
 }
 
 REQUIRED = ["doas", "git", "ssh-keygen", "usermod", "gpasswd", "runuser"]
 RECOMMENDED = ["tmux", "podman"]
 
-MANAGERS = {
-    "dnf":     ["install", "-y"],
-    "apt-get": ["install", "-y"],
-    "zypper":  ["--non-interactive", "install"],
-    "pacman":  ["-S", "--noconfirm"],
+# distro family -> package manager front-ends (in preference order) + install args.
+# Debian-based distros ship both apt-get and (on modern releases) apt; either
+# works for non-interactive installs, so take whichever is present.
+FAMILIES = {
+    "debian": (["apt-get", "apt"], ["install", "-y"]),
+    "rhel":   (["dnf", "yum"], ["install", "-y"]),
+    "suse":   (["zypper"], ["--non-interactive", "install"]),
+    "arch":   (["pacman"], ["-S", "--noconfirm"]),
 }
 
+# os-release ID / ID_LIKE values -> family
+ID_TO_FAMILY = {
+    "debian": "debian", "ubuntu": "debian", "linuxmint": "debian",
+    "raspbian": "debian", "pop": "debian",
+    "fedora": "rhel", "rhel": "rhel", "centos": "rhel", "rocky": "rhel",
+    "almalinux": "rhel", "ol": "rhel", "amzn": "rhel",
+    "opensuse": "suse", "opensuse-leap": "suse", "opensuse-tumbleweed": "suse",
+    "sles": "suse", "sled": "suse", "suse": "suse",
+    "arch": "arch", "archarm": "arch", "manjaro": "arch", "endeavouros": "arch",
+}
 
-def detect_manager():
-    for m in MANAGERS:
-        path = shutil.which(m)
-        if path:
-            return m, path
-    return None, None
+# sbin dirs are not on non-root PATHs on Debian; search them explicitly so
+# installed tools (usermod, gpasswd, runuser) are not reported missing.
+SEARCH_PATH = (os.environ.get("PATH", os.defpath)
+               + ":/usr/local/sbin:/usr/sbin:/sbin")
 
 
 def find(binary):
-    return shutil.which(binary)
+    return shutil.which(binary, path=SEARCH_PATH)
+
+
+def parse_env_file(path):
+    """Parse a KEY=value file (os-release, lsb-release); {} if unreadable."""
+    info = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                info[key] = val.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return info
+
+
+def detect_family():
+    """Return (family, human-readable distro name) or (None, None)."""
+    for path in ("/etc/os-release", "/usr/lib/os-release"):
+        osr = parse_env_file(path)
+        if osr:
+            name = osr.get("PRETTY_NAME") or osr.get("NAME") or osr.get("ID")
+            ids = [osr.get("ID", "").lower()] + osr.get("ID_LIKE", "").lower().split()
+            for i in ids:
+                if i in ID_TO_FAMILY:
+                    return ID_TO_FAMILY[i], name
+            return None, name
+
+    lsb_id = parse_env_file("/etc/lsb-release").get("DISTRIB_ID", "").lower()
+    if lsb_id in ID_TO_FAMILY:
+        return ID_TO_FAMILY[lsb_id], lsb_id
+
+    for path, family in (("/etc/debian_version", "debian"),
+                         ("/etc/redhat-release", "rhel"),
+                         ("/etc/SuSE-release", "suse"),
+                         ("/etc/arch-release", "arch")):
+        if os.path.exists(path):
+            return family, path
+    return None, None
+
+
+def detect_manager(family):
+    """Return (family, manager path) using the detected family, falling back
+    to whatever supported manager is on PATH if the distro is unknown."""
+    if family in FAMILIES:
+        for m in FAMILIES[family][0]:
+            path = find(m)
+            if path:
+                return family, path
+        return family, None
+    for fam, (managers, _) in FAMILIES.items():
+        for m in managers:
+            path = find(m)
+            if path:
+                return fam, path
+    return None, None
 
 
 def main():
@@ -77,10 +155,12 @@ def main():
             print("\ninstall missing tools with: check-deps --install")
         return 1 if missing_req else 0
 
-    mgr_name, mgr_path = detect_manager()
-    if not mgr_name:
-        print("error: no supported package manager found "
-              "(dnf/apt-get/zypper/pacman)", file=sys.stderr)
+    family, distro = detect_family()
+    family, mgr_path = detect_manager(family)
+    if not mgr_path:
+        where = f" for {distro}" if distro else ""
+        print(f"error: no supported package manager found{where} "
+              "(apt/apt-get/dnf/yum/zypper/pacman)", file=sys.stderr)
         return 1
 
     todo = [b for b in missing_req + missing_rec if PKGS.get(b)]
@@ -88,7 +168,7 @@ def main():
     pkgs, seen = [], set()
     for b in todo:
         p = PKGS[b] or PKGS["usermod"]
-        name = p.get(mgr_name)
+        name = p.get(family)
         if name and name not in seen:
             seen.add(name)
             pkgs.append(name)
@@ -96,7 +176,8 @@ def main():
         print("nothing to install")
         return 0
 
-    cmd = [mgr_path] + MANAGERS[mgr_name] + pkgs
+    print(f"\ndistro: {distro or 'unknown'} (family: {family})")
+    cmd = [mgr_path] + FAMILIES[family][1] + pkgs
     if os.geteuid() != 0:
         esc = find("doas") or find("sudo")
         if not esc:
@@ -105,7 +186,7 @@ def main():
             return 1
         cmd = [esc] + cmd
 
-    print(f"\nrunning: {' '.join(cmd)}")
+    print(f"running: {' '.join(cmd)}")
     r = subprocess.run(cmd)
     if r.returncode != 0:
         print("error: installation failed", file=sys.stderr)
